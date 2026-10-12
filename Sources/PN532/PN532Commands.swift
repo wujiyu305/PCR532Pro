@@ -88,15 +88,19 @@ struct PN532CommandBuilder {
         PN532Frame(tfi: .hostToPN532, data: [0x42] + data)
     }
     
+    static func mifareAuthenticate(target: UInt8 = 0x01, keyType: UInt8, block: UInt8, key: [UInt8], uid: [UInt8]) -> PN532Frame {
+        let cleanUid = Array(uid.prefix(4))
+        let paddedUid = cleanUid + [UInt8](repeating: 0x00, count: max(0, 4 - cleanUid.count))
+        let paddedKey = Array(key.prefix(6)) + [UInt8](repeating: 0xFF, count: max(0, 6 - key.count))
+        return PN532Frame(tfi: .hostToPN532, data: [0x40, target, keyType, block] + paddedKey + paddedUid)
+    }
+    
     static func mifareAuthenticateA(target: UInt8 = 0x01, block: UInt8, key: [UInt8], uid: [UInt8]) -> PN532Frame {
-        // InDataExchange auth: 0x40, Tg, 0x60, block, key[6], uid[]
-        PN532Frame(tfi: .hostToPN532,
-                  data: [0x40, target, 0x60, block] + key + uid)
+        mifareAuthenticate(target: target, keyType: 0x60, block: block, key: key, uid: uid)
     }
     
     static func mifareAuthenticateB(target: UInt8 = 0x01, block: UInt8, key: [UInt8], uid: [UInt8]) -> PN532Frame {
-        PN532Frame(tfi: .hostToPN532,
-                  data: [0x40, target, 0x61, block] + key + uid)
+        mifareAuthenticate(target: target, keyType: 0x61, block: block, key: key, uid: uid)
     }
     
     static func mifareReadBlock(target: UInt8 = 0x01, block: UInt8) -> PN532Frame {
@@ -146,26 +150,19 @@ struct PN532ResponseParser {
     static func parseTargetList(_ data: [UInt8]) -> [CardInfo] {
         // Accept both with and without response opcode 0x4B / 0x61
         var body = data
+        let isAutoPoll = (body.first == 0x61)
         if let first = body.first, first == 0x4B || first == 0x61 || first == 0x55 {
             body = Array(body.dropFirst())
         }
-        // InAutoPoll may include type/length wrappers; try simple path first
         guard body.count >= 1 else { return [] }
-        
-        // For InAutoPoll 0x61 response: [nbr, type, len, ...target...]
-        // For InListPassiveTarget 0x4B: [NbTg, Tg, ATQA0, ATQA1, SAK, UIDLen, UID...]
-        // Heuristic: if body[0] is small (<=2) and body.count > 5 treat as NbTg list
         let nbtg = Int(body[0])
         guard nbtg > 0 else { return [] }
         
         var cards = [CardInfo]()
         var offset = 1
         
-        // Detect AutoPoll envelope: after nbr comes type then len
-        if body.count > 3 && nbtg == 1 && body[1] <= 0x20 && Int(body[2]) + 3 <= body.count && body[2] >= 5 {
-            // AutoPoll style: skip type, use len
-            let type = body[1]
-            _ = type
+        // Only if response opcode was 0x61 (InAutoPoll), use AutoPoll envelope
+        if isAutoPoll && body.count > 3 && nbtg == 1 && body[1] <= 0x20 && Int(body[2]) + 3 <= body.count && body[2] >= 5 {
             let len = Int(body[2])
             offset = 3
             let target = Array(body[offset..<min(offset + len, body.count)])

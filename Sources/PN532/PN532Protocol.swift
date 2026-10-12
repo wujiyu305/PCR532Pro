@@ -190,7 +190,10 @@ struct PN532Frame {
         }
         
         let frameData = Array(payload.dropFirst())
-        return (PN532Frame(tfi: tfi, data: frameData), dcsIndex + 1)
+        var consumed = dcsIndex + 1
+        // Consume optional postamble 0x00
+        if consumed < bytes.count && bytes[consumed] == 0x00 { consumed += 1 }
+        return (PN532Frame(tfi: tfi, data: frameData), consumed)
     }
 }
 
@@ -198,8 +201,11 @@ struct PN532Frame {
 class PN532ResponseBuffer {
     private var buffer = [UInt8]()
     private let maxBufferSize = 4096
+    private let lock = NSLock()
     
     func append(_ data: [UInt8]) {
+        lock.lock()
+        defer { lock.unlock() }
         buffer.append(contentsOf: data)
         if buffer.count > maxBufferSize {
             buffer = Array(buffer.suffix(maxBufferSize))
@@ -212,6 +218,8 @@ class PN532ResponseBuffer {
     
     /// Extract next complete frame. ACK frames have empty data + hostToPN532.
     func extractFrame() throws -> PN532Frame? {
+        lock.lock()
+        defer { lock.unlock() }
         guard buffer.count >= 6 else { return nil }
         
         // Align to possible frame start
@@ -256,6 +264,8 @@ class PN532ResponseBuffer {
     }
     
     func clear() {
+        lock.lock()
+        defer { lock.unlock() }
         buffer.removeAll()
     }
 }

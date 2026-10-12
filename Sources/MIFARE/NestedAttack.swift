@@ -10,6 +10,7 @@ import Combine
 // 4. From known plaintext (we know what we sent), derive keystream
 // 5. Use keystream to recover the LFSR state at that point
 // 6. Roll back LFSR to find the original key
+@MainActor
 class NestedAttack: ObservableObject {
     @Published var progress: Double = 0
     @Published var statusMessage = "准备嵌套攻击..."
@@ -51,10 +52,13 @@ class NestedAttack: ObservableObject {
                 ? UInt8(sector * 4 + 3)
                 : UInt8(128 + (sector - 32) * 16 + 15)
             
-            let authFrame = PN532CommandBuilder.inDataExchange(
+            let uid = Array((mifareController?.currentCard?.uid ?? [0, 0, 0, 0]).prefix(4))
+            let authFrame = PN532CommandBuilder.mifareAuthenticate(
                 target: 0x01,
-                mifareCmd: knownKeyType,
-                data: knownKey + [trailerBlock]
+                keyType: knownKeyType,
+                block: trailerBlock,
+                key: knownKey,
+                uid: uid
             )
             
             do {
@@ -185,10 +189,7 @@ class NestedAttack: ObservableObject {
         knownKeyType: UInt8,
         knownSector: Int
     ) async throws -> [UInt8]? {
-        // 1. Build a Crypto1 state from known information
-        let crypto = Crypto1()
-        
-        // 2. Authenticate and capture the encrypted nonces
+        // 1. Authenticate and capture the encrypted nonces
         // 3. Use the nonces to recover the LFSR state
         // 4. The LFSR state at auth time encodes the target sector key
 
@@ -226,6 +227,7 @@ class NestedAttack: ObservableObject {
 // Recovers MIFARE Classic keys from cards without any prior knowledge
 // Algorithm: Send auth requests with random keys, analyze encrypted nonce responses
 // to recover key bits through statistical analysis
+@MainActor
 class DarkSideAttack: ObservableObject {
     @Published var progress: Double = 0
     @Published var statusMessage = "准备暗侧攻击..."
@@ -365,16 +367,19 @@ class DarkSideAttack: ObservableObject {
         // solving systems of boolean equations
         
         // Simplified: try default keys (as fallback)
+        let uid: [UInt8] = [0x00, 0x00, 0x00, 0x00]
         for key in MIFAREKeyManager.defaultKeys {
             // Try to authenticate with this key
-            let authFrame = PN532CommandBuilder.inDataExchange(
+            let authFrame = PN532CommandBuilder.mifareAuthenticate(
                 target: 0x01,
-                mifareCmd: 0x60,
-                data: key + [targetBlock]
+                keyType: 0x60,
+                block: targetBlock,
+                key: key,
+                uid: uid
             )
             
             do {
-                let response = try await bleManager.sendFrame(authFrame)
+                let response = try await bleManager.sendFrame(authFrame, timeout: 0.8)
                 let (success, _) = PN532ResponseParser.parseDataExchange(response.data)
                 if success {
                     return key
@@ -390,6 +395,7 @@ class DarkSideAttack: ObservableObject {
 
 // MARK: - Dictionary Attack
 // Fast scan of all known keys across all sectors
+@MainActor
 class DictionaryAttack: ObservableObject {
     @Published var progress: Double = 0
     @Published var statusMessage = ""
@@ -430,22 +436,30 @@ class DictionaryAttack: ObservableObject {
                         }
                     }
                     
-                    let authFrame = PN532CommandBuilder.inDataExchange(
+                    let authFrame = PN532CommandBuilder.mifareAuthenticate(
                         target: 0x01,
-                        mifareCmd: keyType,
-                        data: key + [trailerBlock]
+                        keyType: keyType,
+                        block: trailerBlock,
+                        key: key,
+                        uid: [0x00, 0x00, 0x00, 0x00]
                     )
                     
                     do {
-                        let response = try await bleManager.sendFrame(authFrame)
+                        let response = try await bleManager.sendFrame(authFrame, timeout: 0.8)
                         let (success, _) = PN532ResponseParser.parseDataExchange(response.data)
                         
                         if success {
                             results[sector] = (key, keyType)
                             statusMessage = "字典攻击: 扇区 \(sector) 密钥已找到! (\(keyType == 0x60 ? "A" : "B"))"
                             break // Found key for this type, move to next
+                        } else {
+                            // Reselect card after failed auth
+                            let listFrame = PN532Frame(tfi: .hostToPN532, data: [0x4A, 0x01, 0x00])
+                            _ = try? await bleManager.sendFrame(listFrame, timeout: 0.5)
                         }
                     } catch {
+                        let listFrame = PN532Frame(tfi: .hostToPN532, data: [0x4A, 0x01, 0x00])
+                        _ = try? await bleManager.sendFrame(listFrame, timeout: 0.5)
                         continue
                     }
                 }

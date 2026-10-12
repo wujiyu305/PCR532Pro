@@ -11,6 +11,7 @@ import Combine
 // - FUID: Can only write UID once (fuses after write)
 // - UFUID: Starts as UID-writable, can be fused to becomme normal card
 // - Super CUID: Can change UID even after fusing
+@MainActor
 class MagicCardController: ObservableObject {
     @Published var statusMessage = ""
     @Published var isOperating = false
@@ -126,6 +127,7 @@ class MagicCardController: ObservableObject {
     }
     
     /// Write complete Block 0 (including UID, SAK, ATQA)
+    /// Write complete Block 0 (including UID, SAK, ATQA)
     /// This is the block that defines the card identity
     func writeBlock0(uid: [UInt8], sak: UInt8 = 0x08, atqa: UInt16 = 0x0004) async throws -> Bool {
         isOperating = true
@@ -133,70 +135,61 @@ class MagicCardController: ObservableObject {
         
         var block0 = [UInt8](repeating: 0x00, count: 16)
         
-        // Byte 0-3 (or 0-6): UID
-        for i in 0..<min(uid.count, 7) {
-            block0[i] = uid[i]
-        }
-        
-        // BCC (Block Check Character) for 4-byte UID
+        // 4-byte UID vs 7-byte UID
         if uid.count == 4 {
-            block0[4] = uid[0] ^ uid[1] ^ uid[2] ^ uid[3]
-        }
-        
-        // SAK at byte 5 (for 4-byte UID) or byte 8 (for 7-byte UID)
-        if uid.count == 4 {
+            block0[0] = uid[0]
+            block0[1] = uid[1]
+            block0[2] = uid[2]
+            block0[3] = uid[3]
+            block0[4] = uid[0] ^ uid[1] ^ uid[2] ^ uid[3] // BCC
             block0[5] = sak
+            block0[6] = UInt8(atqa & 0xFF)
+            block0[7] = UInt8((atqa >> 8) & 0xFF)
+            let defaultTail: [UInt8] = [0x08, 0x04, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05]
+            for i in 0..<8 { block0[8 + i] = defaultTail[i] }
         } else {
+            for i in 0..<min(uid.count, 7) { block0[i] = uid[i] }
+            block0[7] = uid.prefix(7).reduce(0, ^)
             block0[8] = sak
+            block0[9] = UInt8(atqa & 0xFF)
+            block0[10] = UInt8((atqa >> 8) & 0xFF)
         }
         
-        // ATQA at bytes 12-13 (for ISO 14443-3A)
-        block0[14] = UInt8((atqa >> 8) & 0xFF)
-        block0[15] = UInt8(atqa & 0xFF)
-        
-        // Try magic write to Block 0
-        // Different magic cards use different methods
-        
-        // Method 1: Direct write via InDataExchange with special command
-        let writeFrame = PN532CommandBuilder.inCommunicateThru(
-            [0xA0, 0x00] + block0
-        )
-        
-        do {
-            let response = try await bleManager.sendFrame(writeFrame)
-            if response.data.first == 0x0A || response.data.first == 0x00 {
-                statusMessage = "Block 0 写入成功!"
-                isOperating = false
-                return true
+        // Method 1: CUID (Gen 2) - Standard MIFARE auth with default keys then write block 0
+        let defaultKeys: [[UInt8]] = [[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]]
+        for key in defaultKeys {
+            let authFrame = PN532CommandBuilder.mifareAuthenticate(
+                target: 0x01,
+                keyType: 0x60,
+                block: 0,
+                key: key,
+                uid: Array(uid.prefix(4))
+            )
+            if let resp = try? await bleManager.sendFrame(authFrame, timeout: 0.8),
+               PN532ResponseParser.parseDataExchange(resp.data).0 {
+                let writeFrame = PN532CommandBuilder.mifareWriteBlock(target: 0x01, block: 0, data: block0)
+                if let writeResp = try? await bleManager.sendFrame(writeFrame, timeout: 0.8),
+                   PN532ResponseParser.parseDataExchange(writeResp.data).0 {
+                    statusMessage = "Block 0 写入成功 (CUID Gen2)!"
+                    isOperating = false
+                    return true
+                }
+            } else {
+                let listFrame = PN532Frame(tfi: .hostToPN532, data: [0x4A, 0x01, 0x00])
+                _ = try? await bleManager.sendFrame(listFrame, timeout: 0.5)
             }
-        } catch {
-            // Try alternative method
         }
         
-        // Method 2: Special backdoor sequence
-        // Some CUID cards need: HALT + specific command + data
-        let haltFrame = PN532CommandBuilder.inCommunicateThru([0x50, 0x00, 0x00, 0x00])
-        let _ = try? await bleManager.sendFrame(haltFrame)
-        try await Task.sleep(nanoseconds: 50_000_000)
-        
-        // Send write command with A2 (some cards use this)
-        let writeFrame2 = PN532CommandBuilder.inCommunicateThru(
-            [0xA2, 0x00] + block0
-        )
-        
-        do {
-            let response = try await bleManager.sendFrame(writeFrame2)
-            if response.data.first == 0x0A || response.data.first == 0x00 {
-                statusMessage = "Block 0 写入成功 (方法2)!"
-                isOperating = false
-                return true
-            }
-        } catch {
-            statusMessage = "Block 0 写入失败"
+        // Method 2: Gen 1 UID backdoor (InCommunicateThru A0)
+        let writeFrame = PN532CommandBuilder.inCommunicateThru([0xA0, 0x00] + block0)
+        if let response = try? await bleManager.sendFrame(writeFrame, timeout: 0.8),
+           (response.data.first == 0x0A || response.data.first == 0x00) {
+            statusMessage = "Block 0 写入成功 (UID 后门)!"
             isOperating = false
-            return false
+            return true
         }
         
+        statusMessage = "Block 0 写入失败"
         isOperating = false
         return false
     }
@@ -282,35 +275,47 @@ class MagicCardController: ObservableObject {
             let startBlock = sector < 32 ? sector * 4 : 128 + (sector - 32) * 16
             let trailerBlock = startBlock + (sector < 32 ? 3 : 15)
             
-            // Try key A first (factory default)
-            let authFrame = PN532CommandBuilder.inDataExchange(
-                target: 0x01,
-                mifareCmd: 0x60,
-                data: [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] + [UInt8(trailerBlock)]
-            )
+            // Try key A first (factory default), then sourceDump known key if available
+            let cleanUid = Array(uid.prefix(4))
+            var writeKeys: [[UInt8]] = [[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]]
+            if let known = sourceDump.knownKeys[sector] {
+                writeKeys.append(known.keyData)
+            }
             
-            do {
-                let authResp = try await bleManager.sendFrame(authFrame)
-                let (authSuccess, _) = PN532ResponseParser.parseDataExchange(authResp.data)
-                
-                if authSuccess {
-                    // Write blocks in this sector
-                    let blockCount = sector < 32 ? 4 : 16
-                    for b in 0..<blockCount {
-                        let blockData = Array(data[b * 16..<min((b + 1) * 16, data.count)])
-                        if blockData.count == 16 {
-                            let writeFrame = PN532CommandBuilder.mifareWriteBlock(
-                                target: 0x01,
-                                block: UInt8(startBlock + b),
-                                data: blockData
-                            )
-                            let _ = try? await bleManager.sendFrame(writeFrame)
-                        }
+            var sectorAuthSuccess = false
+            for k in writeKeys {
+                let authFrame = PN532CommandBuilder.mifareAuthenticate(
+                    target: 0x01,
+                    keyType: 0x60,
+                    block: UInt8(trailerBlock),
+                    key: k,
+                    uid: cleanUid
+                )
+                if let authResp = try? await bleManager.sendFrame(authFrame, timeout: 0.8),
+                   PN532ResponseParser.parseDataExchange(authResp.data).0 {
+                    sectorAuthSuccess = true
+                    break
+                } else {
+                    let listFrame = PN532Frame(tfi: .hostToPN532, data: [0x4A, 0x01, 0x00])
+                    _ = try? await bleManager.sendFrame(listFrame, timeout: 0.5)
+                }
+            }
+            
+            if sectorAuthSuccess {
+                let blockCount = sector < 32 ? 4 : 16
+                for b in 0..<blockCount {
+                    let blockData = Array(data[b * 16..<min((b + 1) * 16, data.count)])
+                    if blockData.count == 16 {
+                        let writeFrame = PN532CommandBuilder.mifareWriteBlock(
+                            target: 0x01,
+                            block: UInt8(startBlock + b),
+                            data: blockData
+                        )
+                        _ = try? await bleManager.sendFrame(writeFrame, timeout: 0.8)
                     }
                 }
-            } catch {
+            } else {
                 statusMessage = "克隆: 扇区 \(sector) 跳过 (认证失败)"
-                continue
             }
         }
         

@@ -133,7 +133,7 @@ class MIFAREKeyManager {
 
 // MARK: - MIFARE Card Dump
 struct MIFAREDump: Identifiable, Codable {
-    let id = UUID()
+    var id: UUID = UUID()
     var name: String
     var date: Date
     var uid: [UInt8]
@@ -182,14 +182,12 @@ struct MIFAREDump: Identifiable, Codable {
     
     /// Load dump from binary data
     static func fromBinary(_ data: Data, name: String) -> MIFAREDump? {
-        guard data.count >= 4 else { return nil }
-        var offset = 0
-        let uid = [data[offset]]; offset += 1
+        guard data.count >= 7 else { return nil }
         // Actually UID can be 4 or 7 bytes... simplified
         let _uid = [UInt8](data[0..<4])
         let sak = data[4]
         let atqaValue = (UInt16(data[5]) << 8) | UInt16(data[6])
-        offset = 7
+        var offset = 7
         
         var sectors = [Int: [UInt8]]()
         var sectorNum = 0
@@ -207,6 +205,7 @@ struct MIFAREDump: Identifiable, Codable {
 
 // MARK: - MIFARE Card Controller
 // This is the main class that handles all MIFARE operations via PN532
+@MainActor
 class MIFAREController: ObservableObject {
     @Published var currentCard: CardInfo?
     @Published var sectors = [MIFARESector]()
@@ -225,69 +224,81 @@ class MIFAREController: ObservableObject {
     
     // MARK: - Card Detection
     
-    /// Detect card and get UID/SAK/ATQA (libnfc-style InListPassiveTarget)
+    /// Detect card and get UID/SAK/ATQA with robust polling window
     func detectCard() async throws -> CardInfo {
         statusMessage = "Detecting card..."
         
-        // RFConfiguration MaxRetries (cmd 0x32 item 0x05) — improves passive activation
+        // RFConfiguration MaxRetries: passive = 0x14 (20 attempts, ~300-400ms RF activation window)
         _ = try? await bleManager.sendFrame(
-            PN532Frame(tfi: .hostToPN532, data: [0x32, 0x05, 0xFF, 0x01, 0xFF]),
-            timeout: 4.0
+            PN532Frame(tfi: .hostToPN532, data: [0x32, 0x05, 0xFF, 0x01, 0x14]),
+            timeout: 1.0
         )
         
         // InListPassiveTarget: max 1, 106kbps type A
         let listFrame = PN532Frame(tfi: .hostToPN532, data: [0x4A, 0x01, 0x00])
-        do {
-            let response = try await bleManager.sendFrame(listFrame, timeout: 12.0)
-            let cards = PN532ResponseParser.parseTargetList(response.data)
-            if let card = cards.first {
-                await MainActor.run {
+        let deadline = Date().addingTimeInterval(2.5)
+        
+        while Date() < deadline {
+            do {
+                let response = try await bleManager.sendFrame(listFrame, timeout: 1.5)
+                let cards = PN532ResponseParser.parseTargetList(response.data)
+                if let card = cards.first {
                     currentCard = card
                     statusMessage = "Found: \(card.typeDescription) UID \(card.uidString)"
+                    return card
                 }
-                return card
+            } catch {
+                // If single poll times out or returns no card, continue loop
             }
-            throw PN532Error.noCardPresent
-        } catch PN532Error.timeout {
-            // Retry once after re-wake via another firmware poke
-            statusMessage = "Retry detect..."
-            let response = try await bleManager.sendFrame(listFrame, timeout: 12.0)
-            let cards = PN532ResponseParser.parseTargetList(response.data)
-            guard let card = cards.first else { throw PN532Error.noCardPresent }
-            await MainActor.run {
-                currentCard = card
-                statusMessage = "Found: \(card.typeDescription) UID \(card.uidString)"
-            }
-            return card
+            try await Task.sleep(nanoseconds: 50_000_000) // 50ms pause between attempts
         }
+        
+        statusMessage = "No card detected"
+        throw PN532Error.noCardPresent
     }
     
     func detectCardDirect() async throws -> CardInfo {
         try await detectCard()
     }
     
+    /// Re-activate card to exit HALT state after a failed authentication
+    func reselectCard() async throws {
+        let listFrame = PN532Frame(tfi: .hostToPN532, data: [0x4A, 0x01, 0x00])
+        _ = try? await bleManager.sendFrame(listFrame, timeout: 0.6)
+    }
+    
     // MARK: - Authentication
     
     /// Authenticate with a sector/block using given key
     func authenticate(sector: Int, block: UInt8, key: [UInt8], keyType: UInt8) async throws -> Bool {
-        let authFrame = PN532CommandBuilder.inDataExchange(
+        let uid = currentCard?.uid ?? [0x00, 0x00, 0x00, 0x00]
+        let authFrame = PN532CommandBuilder.mifareAuthenticate(
             target: 0x01,
-            mifareCmd: keyType,
-            data: key + [block]
+            keyType: keyType,
+            block: block,
+            key: key,
+            uid: uid
         )
         
-        let response = try await bleManager.sendFrame(authFrame)
-        let (success, _) = PN532ResponseParser.parseDataExchange(response.data)
-        
-        if success {
-            if sector < sectors.count {
-                sectors[sector].isAuthenticated = true
-                sectors[sector].knownKey = key
-                sectors[sector].knownKeyType = keyType
+        do {
+            let response = try await bleManager.sendFrame(authFrame, timeout: 0.8)
+            let (success, _) = PN532ResponseParser.parseDataExchange(response.data)
+            
+            if success {
+                if sector < sectors.count {
+                    sectors[sector].isAuthenticated = true
+                    sectors[sector].knownKey = key
+                    sectors[sector].knownKeyType = keyType
+                }
+                return true
             }
+        } catch {
+            // Auth packet timeout or comm error
         }
         
-        return success
+        // When auth fails, MIFARE card enters HALT state. Reselect card to allow subsequent auth attempts.
+        _ = try? await reselectCard()
+        return false
     }
     
     /// Try to authenticate with known keys (dictionary attack for a single sector)
@@ -325,7 +336,6 @@ class MIFAREController: ObservableObject {
     
     /// Read a sector (all blocks)
     func readSector(sectorNum: Int, key: [UInt8], keyType: UInt8) async throws -> MIFARESector {
-        let sector = MIFARESector(number: sectorNum, blocks: [])
         let is4K = sectorNum >= 32
         let blockCount = is4K ? 16 : 4
         let startBlock = sectorNum < 32 ? sectorNum * 4 : 128 + (sectorNum - 32) * 16
@@ -365,62 +375,68 @@ class MIFAREController: ObservableObject {
         progress = 0
         statusMessage = "开始全卡读取..."
         
+        // Ensure card is active before starting
+        _ = try? await reselectCard()
+        
         var allSectors = [MIFARESector]()
         let totalSectors = currentCard?.totalSectors ?? 16
+        var lastWorkingKey: [UInt8]? = nil
+        var lastWorkingKeyType: UInt8 = 0x60
         
-        // First, try default keys on sector 0 to get a known key
-        let (found, key, keyType) = try await tryDefaultKeys(sector: 0, block: 0)
-        
-        if !found {
-            statusMessage = "默认密钥无效，无法读取"
-            isReading = false
-            throw PN532Error.authFailed
-        }
-        
-        // Read sector 0 first
-        let sector0 = try await readSector(sectorNum: 0, key: key, keyType: keyType)
-        allSectors.append(sector0)
-        progress = 1.0 / Double(totalSectors)
-        
-        // Try to read remaining sectors
-        for i in 1..<totalSectors {
-            await MainActor.run {
-                statusMessage = "读取扇区 \(i)/\(totalSectors - 1)..."
-                progress = Double(i) / Double(totalSectors)
+        for i in 0..<totalSectors {
+            statusMessage = "读取扇区 \(i)/\(totalSectors - 1)..."
+            progress = Double(i) / Double(totalSectors)
+            
+            let is4K = i >= 32
+            let blockCount = is4K ? 16 : 4
+            let startBlock = i < 32 ? i * 4 : 128 + (i - 32) * 16
+            let trailerBlock = UInt8(startBlock + blockCount - 1)
+            
+            var sectorReadSuccess = false
+            
+            // Fast path: try last known working key first
+            if let wKey = lastWorkingKey {
+                if let sector = try? await readSector(sectorNum: i, key: wKey, keyType: lastWorkingKeyType) {
+                    allSectors.append(sector)
+                    sectorReadSuccess = true
+                }
             }
             
-            // Try known key first
-            do {
-                let sector = try await readSector(sectorNum: i, key: key, keyType: keyType)
-                allSectors.append(sector)
-            } catch {
-                // Key didn't work for this sector, try dictionary attack
-                let sectorStartBlock = i < 32 ? UInt8(i * 4 + 3) : UInt8(128 + (i - 32) * 16 + 15)
-                let (foundSectorKey, sectorKey, sectorKeyType) = try await tryDefaultKeys(sector: i, block: sectorStartBlock)
-                
-                if foundSectorKey {
-                    let sector = try await readSector(sectorNum: i, key: sectorKey, keyType: sectorKeyType)
-                    allSectors.append(sector)
-                } else {
-                    // Create empty sector
-                    let blockCount = i >= 32 ? 16 : 4
-                    let startBlock = i < 32 ? i * 4 : 128 + (i - 32) * 16
-                    var blocks = [MIFAREBlock]()
-                    for b in 0..<blockCount {
-                        blocks.append(MIFAREBlock(number: UInt8(startBlock + b), data: [UInt8](repeating: 0x00, count: 16)))
+            // If not successful, try default keys dictionary
+            if !sectorReadSuccess {
+                let (foundKey, sKey, sKeyType) = try await tryDefaultKeys(sector: i, block: trailerBlock)
+                if foundKey {
+                    lastWorkingKey = sKey
+                    lastWorkingKeyType = sKeyType
+                    if let sector = try? await readSector(sectorNum: i, key: sKey, keyType: sKeyType) {
+                        allSectors.append(sector)
+                        sectorReadSuccess = true
                     }
-                    var emptySector = MIFARESector(number: i, blocks: blocks)
-                    emptySector.isAuthenticated = false
-                    allSectors.append(emptySector)
-                    statusMessage = "扇区 \(i): 密钥未知，跳过"
                 }
+            }
+            
+            // If still not readable, create empty placeholder sector
+            if !sectorReadSuccess {
+                var blocks = [MIFAREBlock]()
+                for b in 0..<blockCount {
+                    blocks.append(MIFAREBlock(number: UInt8(startBlock + b), data: [UInt8](repeating: 0x00, count: 16)))
+                }
+                var emptySector = MIFARESector(number: i, blocks: blocks)
+                emptySector.isAuthenticated = false
+                allSectors.append(emptySector)
+                statusMessage = "扇区 \(i): 密钥未知，跳过"
             }
         }
         
         sectors = allSectors
         isReading = false
         progress = 1.0
-        statusMessage = "读取完成: \(allSectors.filter { $0.isAuthenticated }.count)/\(totalSectors) 个扇区已解密"
+        let decryptedCount = allSectors.filter { $0.isAuthenticated }.count
+        statusMessage = "读取完成: \(decryptedCount)/\(totalSectors) 个扇区已解密"
+        
+        if decryptedCount == 0 {
+            throw PN532Error.authFailed
+        }
         
         return allSectors
     }

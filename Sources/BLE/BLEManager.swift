@@ -41,6 +41,32 @@ struct BLEDevice: Identifiable, Equatable {
     }
 }
 
+@MainActor
+private class AsyncLock {
+    private var isLocked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    
+    func lock() async {
+        if !isLocked {
+            isLocked = true
+            return
+        }
+        await withCheckedContinuation { cont in
+            waiters.append(cont)
+        }
+    }
+    
+    func unlock() {
+        if !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            next.resume()
+        } else {
+            isLocked = false
+        }
+    }
+}
+
+@MainActor
 class BLEManager: NSObject, ObservableObject {
     @Published var isScanning = false
     @Published var isConnected = false
@@ -68,12 +94,15 @@ class BLEManager: NSObject, ObservableObject {
     private var allCharacteristics: [CBCharacteristic] = []
     private var responseBuffer = PN532ResponseBuffer()
     private var frameWaitContinuation: CheckedContinuation<PN532Frame, Error>?
+    private var timeoutWorkItem: DispatchWorkItem?
+    private let sendLock = AsyncLock()
     private var didInitPN532 = false
     private var linkVerified = false
     private var mtuChunkSize = 20
     private var useWithoutResponse = true
     private var rxByteCount: Int = 0
     private var debugLines: [String] = []
+    private var lastTxTime: Date = .distantPast
     
     override init() {
         super.init()
@@ -139,11 +168,49 @@ class BLEManager: NSObject, ObservableObject {
             throw PN532Error.communicationError("Not ready")
         }
         
+        await sendLock.lock()
+        defer { 
+            lastTxTime = Date()
+            sendLock.unlock() 
+        }
+        
         if !didInitPN532 {
             try await probeAndInit()
         }
         
+        // If idle for >150ms, wake up PN532 first, then pause 15ms for clock stabilization
+        let isIdle = Date().timeIntervalSince(lastTxTime) > 0.15
+        if isIdle {
+            try? await writeBytes(PCR532BLE.wakeUp, peripheral: peripheral)
+            try? await Task.sleep(nanoseconds: 15_000_000)
+        }
+        
         let payload = frame.encode()
+        let stream = payload
+        
+        // Fast path: if link is already verified, use active characteristics directly.
+        // Send clean payload without prepended wake preamble to avoid MTU packet splitting & UART frame errors.
+        if linkVerified, let writeChar = writeCharacteristic {
+            responseBuffer.clear()
+            appendDebug("TX W=\(short(writeChar.uuid)) N=\(short(notifyCharacteristic?.uuid)) WOR=\(useWithoutResponse) \(hex(stream))")
+            try await writeBytes(stream, peripheral: peripheral)
+            
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                let rem = max(deadline.timeIntervalSinceNow, 0.05)
+                let resp = try await waitForNextFrame(timeout: rem)
+                if resp.isAckPlaceholder {
+                    appendDebug("RX ACK")
+                    continue
+                }
+                if resp.tfi == .pn532ToHost {
+                    appendDebug("RX \(hex(resp.data))")
+                    return resp
+                }
+            }
+            throw PN532Error.timeout
+        }
+        
         let maps = buildCharMaps()
         // Prefer last known good map first
         var ordered = maps
@@ -175,7 +242,6 @@ class BLEManager: NSObject, ObservableObject {
             
             responseBuffer.clear()
             // CRITICAL (libnfc): wake preamble immediately before every command
-            let stream = PCR532BLE.wakeUp + payload
             appendDebug("TX#\(idx) W=\(short(map.write.uuid)) N=\(short(map.notify?.uuid)) WOR=\(map.withoutResponse) \(hex(stream))")
             
             do {
@@ -186,7 +252,7 @@ class BLEManager: NSObject, ObservableObject {
                 continue
             }
             
-            let deadline = Date().addingTimeInterval(min(timeout, 4.0))
+            let deadline = Date().addingTimeInterval(min(timeout, 2.0))
             do {
                 while Date() < deadline {
                     let rem = max(deadline.timeIntervalSinceNow, 0.05)
@@ -366,17 +432,22 @@ class BLEManager: NSObject, ObservableObject {
         }
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<PN532Frame, Error>) in
             self.frameWaitContinuation = cont
-            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            let workItem = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
                 if let c = self.frameWaitContinuation {
                     self.frameWaitContinuation = nil
+                    self.timeoutWorkItem = nil
                     c.resume(throwing: PN532Error.timeout)
                 }
             }
+            self.timeoutWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: workItem)
         }
     }
     
     private func failPending(_ error: Error) {
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = nil
         if let c = frameWaitContinuation {
             frameWaitContinuation = nil
             c.resume(throwing: error)
@@ -387,6 +458,8 @@ class BLEManager: NSObject, ObservableObject {
         do {
             while let frame = try responseBuffer.extractFrame() {
                 if let c = frameWaitContinuation {
+                    timeoutWorkItem?.cancel()
+                    timeoutWorkItem = nil
                     frameWaitContinuation = nil
                     c.resume(returning: frame)
                     return
@@ -396,6 +469,8 @@ class BLEManager: NSObject, ObservableObject {
             }
         } catch {
             if let c = frameWaitContinuation {
+                timeoutWorkItem?.cancel()
+                timeoutWorkItem = nil
                 frameWaitContinuation = nil
                 c.resume(throwing: error)
             }
@@ -419,10 +494,10 @@ class BLEManager: NSObject, ObservableObject {
         let maxOnce = peripheral.maximumWriteValueLength(for: writeType)
         let chunkSize = max(20, maxOnce > 0 ? min(maxOnce, 180) : mtuChunkSize)
         
-        // Prefer single packet for wake+frame (usually < 40 bytes)
+        // Prefer single packet for frame (PN532 frames are usually 7-20 bytes)
         if data.count <= chunkSize {
             peripheral.writeValue(Data(data), for: writeChar, type: writeType)
-            try await Task.sleep(nanoseconds: 80_000_000)
+            try await Task.sleep(nanoseconds: 10_000_000)
             return
         }
         
@@ -431,9 +506,9 @@ class BLEManager: NSObject, ObservableObject {
             let end = min(offset + chunkSize, data.count)
             peripheral.writeValue(Data(Array(data[offset..<end])), for: writeChar, type: writeType)
             offset = end
-            try await Task.sleep(nanoseconds: 30_000_000)
+            try await Task.sleep(nanoseconds: 15_000_000)
         }
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await Task.sleep(nanoseconds: 15_000_000)
     }
     
     private func appendDebug(_ s: String) {
@@ -483,7 +558,7 @@ class BLEManager: NSObject, ObservableObject {
     }
 }
 
-extension BLEManager: CBCentralManagerDelegate {
+extension BLEManager: @preconcurrency CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         delegate?.bleDidUpdateState(central.state == .poweredOn)
     }
@@ -534,7 +609,7 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 }
 
-extension BLEManager: CBPeripheralDelegate {
+extension BLEManager: @preconcurrency CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error = error {
             lastErrorMessage = error.localizedDescription

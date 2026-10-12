@@ -153,15 +153,17 @@ struct NestedAttackConfigView: View {
         let targets = Array(targetSectorRange.lowerBound...targetSectorRange.upperBound)
         
         Task {
-            _ = try await nestedAttack.runNestedAttack(
-                knownSector: knownSector,
-                knownKey: key,
-                knownKeyType: keyType,
-                targetSectors: targets
-            )
-            await MainActor.run {
-                dismiss()
+            do {
+                _ = try await nestedAttack.runNestedAttack(
+                    knownSector: knownSector,
+                    knownKey: key,
+                    knownKeyType: keyType,
+                    targetSectors: targets
+                )
+            } catch {
+                // Handled in NestedAttack state
             }
+            dismiss()
         }
     }
 }
@@ -325,12 +327,13 @@ struct DarkSideAttackConfigView: View {
             : UInt8(128 + (targetSector - 32) * 16 + 15)
         
         Task {
-            _ = try await darkSideAttack.recoverKey(
-                targetBlock: block,
-                keyType: useKeyA ? 0x60 : 0x61
-            )
-            await MainActor.run {
-                // Keep sheet open to show results
+            do {
+                _ = try await darkSideAttack.recoverKey(
+                    targetBlock: block,
+                    keyType: useKeyA ? 0x60 : 0x61
+                )
+            } catch {
+                // Handled in DarkSideAttack state
             }
         }
     }

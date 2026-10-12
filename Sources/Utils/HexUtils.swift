@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - Hex Utilities
 struct HexUtils {
@@ -246,8 +249,30 @@ struct DumpFileManager {
     }
 }
 
+// MARK: - Haptic Feedback Manager
+@MainActor
+enum HapticFeedback {
+    static func success() {
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
+    static func error() {
+        UINotificationFeedbackGenerator().notificationOccurred(.error)
+    }
+    static func warning() {
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+    }
+    static func selection() {
+        UISelectionFeedbackGenerator().selectionChanged()
+    }
+    static func impact(_ style: UIImpactFeedbackGenerator.FeedbackStyle = .medium) {
+        UIImpactFeedbackGenerator(style: style).impactOccurred()
+    }
+}
+
 // MARK: - KeyStore (Persistent key storage with UserDefaults)
+@MainActor
 class KeyStore: ObservableObject {
+    static let shared = KeyStore()
     @Published var savedKeys = [(String, [UInt8])]()  // (label, key)
     
     private let defaults = UserDefaults.standard
@@ -270,6 +295,28 @@ class KeyStore: ObservableObject {
                 savedKeys.append((label, key))
             }
         }
+    }
+    
+    func hasKey(_ key: [UInt8]) -> Bool {
+        savedKeys.contains { $0.1 == key }
+    }
+    
+    @discardableResult
+    func saveKeyIfNotExists(label: String, key: [UInt8]) -> Bool {
+        guard key.count == 6 else { return false }
+        if hasKey(key) { return false }
+        saveKey(label: label, key: key)
+        return true
+    }
+    
+    func saveMultipleKeys(_ keys: [(String, [UInt8])]) -> Int {
+        var added = 0
+        for item in keys {
+            if saveKeyIfNotExists(label: item.0, key: item.1) {
+                added += 1
+            }
+        }
+        return added
     }
     
     func saveKey(label: String, key: [UInt8]) {

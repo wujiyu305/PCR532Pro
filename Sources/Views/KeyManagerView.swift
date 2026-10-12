@@ -351,10 +351,12 @@ struct AttackConfigView: View {
     
     private func startAttack() {
         Task {
-            _ = try await dictionaryAttack.run(totalSectors: totalSectors)
-            await MainActor.run {
-                dismiss()
+            do {
+                _ = try await dictionaryAttack.run(totalSectors: totalSectors)
+            } catch {
+                // Attack error handled in ViewModel
             }
+            dismiss()
         }
     }
 }

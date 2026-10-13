@@ -30,7 +30,7 @@ struct ContentView: View {
     
     var body: some View {
         TabView(selection: $selectedTab) {
-            // Tab 1: Device & Card
+            // Tab 1: Device & Card (with Nested Attack & Magic Card Tools)
             NavigationView {
                 mainDeviceView
                     .navigationTitle("PCR532 Pro")
@@ -56,7 +56,7 @@ struct ContentView: View {
                     }
             }
             .tabItem {
-                Label("设备", systemImage: "creditcard.and.123")
+                Label("读卡", systemImage: "creditcard.and.123")
             }
             .tag(0)
             
@@ -90,31 +90,18 @@ struct ContentView: View {
             }
             .tag(1)
             
-            // Tab 3: Keys & Attacks
-            KeyManagerView(
-                keyStore: keyStore,
+            // Tab 3: Data Management (Dumps & Keys)
+            DataManagementView(
                 mifareController: mifareController,
-                dictionaryAttack: dictionaryAttack,
-                nestedAttack: nestedAttack,
-                darkSideAttack: darkSideAttack,
+                keyStore: keyStore,
                 bleManager: bleManager
             )
             .tabItem {
-                Label("密钥", systemImage: "key.fill")
+                Label("数据", systemImage: "folder.fill")
             }
             .tag(2)
             
-            // Tab 4: Magic Card
-            MagicCardView(
-                magicController: magicController,
-                mifareController: mifareController
-            )
-            .tabItem {
-                Label("魔术卡", systemImage: "wand.and.stars")
-            }
-            .tag(3)
-            
-            // Tab 5: Settings
+            // Tab 4: Settings
             SettingsView(
                 bleManager: bleManager,
                 mifareController: mifareController
@@ -122,7 +109,7 @@ struct ContentView: View {
             .tabItem {
                 Label("设置", systemImage: "gearshape.fill")
             }
-            .tag(4)
+            .tag(3)
         }
         .accentColor(.blue)
         .fullScreenCover(isPresented: $showScanner) {
@@ -153,7 +140,13 @@ struct ContentView: View {
             .padding(.top, 4)
             
             // Card info section
-            CardInfoView(cardInfo: mifareController.currentCard, mifareController: mifareController, bleManager: bleManager)
+            CardInfoView(
+                cardInfo: mifareController.currentCard,
+                mifareController: mifareController,
+                bleManager: bleManager,
+                nestedAttack: nestedAttack,
+                magicController: magicController
+            )
         }
     }
 }

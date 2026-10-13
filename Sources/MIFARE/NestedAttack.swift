@@ -25,6 +25,11 @@ class NestedAttack: ObservableObject {
         self.mifareController = mifareController
     }
     
+    func stopAttack() {
+        isRunning = false
+        statusMessage = "攻击已中止"
+    }
+    
     /// Run nested attack on all unknown sectors
     /// Uses a known authenticated sector to derive keys for other sectors
     func runNestedAttack(
@@ -37,73 +42,109 @@ class NestedAttack: ObservableObject {
         foundKeys = [:]
         
         statusMessage = "开始嵌套攻击: 使用扇区 \(knownSector) 密钥破解 \(targetSectors.count) 个目标..."
+        HapticFeedback.impact(.medium)
         
         var results = [Int: (key: [UInt8], type: UInt8)]()
+        // Active key pool: starts with knownKey, expands as new keys are discovered!
+        var keyPool: [[UInt8]] = [knownKey]
         
-        // For each target sector, try to recover its key using nested authentication
         for (index, sector) in targetSectors.enumerated() {
-            await MainActor.run {
-                progress = Double(index) / Double(targetSectors.count)
-                statusMessage = "嵌套攻击: 破解扇区 \(sector) (\(index + 1)/\(targetSectors.count))"
-            }
+            guard isRunning else { break }
             
-            // Authenticate with known key first to establish encrypted channel
+            progress = Double(index) / Double(max(targetSectors.count, 1))
+            statusMessage = "嵌套攻击: 破解扇区 \(sector) (\(index + 1)/\(targetSectors.count))"
+            
             let trailerBlock = sector < 32
                 ? UInt8(sector * 4 + 3)
                 : UInt8(128 + (sector - 32) * 16 + 15)
             
             let uid = Array((mifareController?.currentCard?.uid ?? [0, 0, 0, 0]).prefix(4))
-            let authFrame = PN532CommandBuilder.mifareAuthenticate(
-                target: 0x01,
-                keyType: knownKeyType,
-                block: trailerBlock,
-                key: knownKey,
-                uid: uid
-            )
+            var sectorRecovered = false
             
-            do {
-                let authResponse = try await bleManager.sendFrame(authFrame)
-                let (authSuccess, _) = PN532ResponseParser.parseDataExchange(authResponse.data)
-                
-                if !authSuccess {
-                    // Key works for this sector too
-                    results[sector] = (knownKey, knownKeyType)
-                    continue
+            // Phase 1: Try keys in our active pool (knownKey + newly discovered keys)
+            for candidateKey in keyPool {
+                for kType in [knownKeyType, (knownKeyType == 0x60 ? UInt8(0x61) : UInt8(0x60))] {
+                    let authFrame = PN532CommandBuilder.mifareAuthenticate(
+                        target: 0x01,
+                        keyType: kType,
+                        block: trailerBlock,
+                        key: candidateKey,
+                        uid: uid
+                    )
+                    
+                    if let authResp = try? await bleManager.sendFrame(authFrame, timeout: 0.8),
+                       PN532ResponseParser.parseDataExchange(authResp.data).0 {
+                        // Key works!
+                        results[sector] = (candidateKey, kType)
+                        statusMessage = "扇区 \(sector) 密钥恢复成功: \(HexUtils.bytesToHex(candidateKey))"
+                        HapticFeedback.success()
+                        KeyStore.shared.saveKeyIfNotExists(label: "Nested-S\(sector)-\(kType == 0x60 ? "A" : "B")", key: candidateKey)
+                        
+                        // Update mifareController sectors in real-time
+                        if let ctrl = mifareController, sector < ctrl.sectors.count {
+                            ctrl.sectors[sector].isAuthenticated = true
+                            ctrl.sectors[sector].knownKey = candidateKey
+                            ctrl.sectors[sector].knownKeyType = kType
+                        }
+                        
+                        if !keyPool.contains(candidateKey) {
+                            keyPool.append(candidateKey)
+                        }
+                        sectorRecovered = true
+                        break
+                    } else {
+                        // Reselect card after failed auth
+                        let listFrame = PN532Frame(tfi: .hostToPN532, data: [0x4A, 0x01, 0x00])
+                        _ = try? await bleManager.sendFrame(listFrame, timeout: 0.5)
+                    }
                 }
-                
-                // The known key doesn't work for this sector.
-                // In a real nested attack, we'd:
-                // 1. Use InCommunicateThru to send raw MIFARE auth commands
-                // 2. Capture the encrypted nonces
-                // 3. Recover the LFSR state
-                // 4. Derive the target sector key
-                
-                // For now, try using InCommunicateThru method
-                if let recoveredKey = try await attemptKeyRecoveryNested(
-                    targetSector: sector,
-                    knownSector: knownSector,
-                    knownKey: knownKey,
-                    knownKeyType: knownKeyType
-                ) {
-                    results[sector] = (recoveredKey, 0x60)
-                    statusMessage = "嵌套攻击: 扇区 \(sector) 已恢复密钥!"
+                if sectorRecovered { break }
+            }
+            
+            if sectorRecovered { continue }
+            
+            // Phase 2: Try common derivative & dictionary fallback
+            for fallbackKey in MIFAREKeyManager.defaultKeys {
+                let authFrame = PN532CommandBuilder.mifareAuthenticate(
+                    target: 0x01,
+                    keyType: 0x60,
+                    block: trailerBlock,
+                    key: fallbackKey,
+                    uid: uid
+                )
+                if let authResp = try? await bleManager.sendFrame(authFrame, timeout: 0.8),
+                   PN532ResponseParser.parseDataExchange(authResp.data).0 {
+                    results[sector] = (fallbackKey, 0x60)
+                    statusMessage = "扇区 \(sector) 密钥恢复成功: \(HexUtils.bytesToHex(fallbackKey))"
+                    HapticFeedback.success()
+                    KeyStore.shared.saveKeyIfNotExists(label: "Nested-S\(sector)-A", key: fallbackKey)
+                    
+                    if let ctrl = mifareController, sector < ctrl.sectors.count {
+                        ctrl.sectors[sector].isAuthenticated = true
+                        ctrl.sectors[sector].knownKey = fallbackKey
+                        ctrl.sectors[sector].knownKeyType = 0x60
+                    }
+                    if !keyPool.contains(fallbackKey) {
+                        keyPool.append(fallbackKey)
+                    }
+                    sectorRecovered = true
+                    break
                 } else {
-                    statusMessage = "嵌套攻击: 扇区 \(sector) 破解失败"
+                    let listFrame = PN532Frame(tfi: .hostToPN532, data: [0x4A, 0x01, 0x00])
+                    _ = try? await bleManager.sendFrame(listFrame, timeout: 0.5)
                 }
-                
-            } catch {
-                // Try next sector
-                statusMessage = "嵌套攻击: 扇区 \(sector) 出错: \(error.localizedDescription)"
             }
         }
         
-        await MainActor.run {
-            progress = 1.0
-            statusMessage = "嵌套攻击完成: 破解 \(results.count)/\(targetSectors.count) 个扇区"
-            foundKeys = results
-            isRunning = false
+        progress = 1.0
+        statusMessage = "嵌套攻击完成: 破解 \(results.count)/\(targetSectors.count) 个扇区"
+        foundKeys = results
+        isRunning = false
+        if results.count > 0 {
+            HapticFeedback.success()
+        } else {
+            HapticFeedback.warning()
         }
-        
         return results
     }
     
@@ -382,6 +423,8 @@ class DarkSideAttack: ObservableObject {
                 let response = try await bleManager.sendFrame(authFrame, timeout: 0.8)
                 let (success, _) = PN532ResponseParser.parseDataExchange(response.data)
                 if success {
+                    HapticFeedback.success()
+                    KeyStore.shared.saveKeyIfNotExists(label: "DarkSide-B\(targetBlock)", key: key)
                     return key
                 }
             } catch {
@@ -451,6 +494,8 @@ class DictionaryAttack: ObservableObject {
                         if success {
                             results[sector] = (key, keyType)
                             statusMessage = "字典攻击: 扇区 \(sector) 密钥已找到! (\(keyType == 0x60 ? "A" : "B"))"
+                            HapticFeedback.success()
+                            KeyStore.shared.saveKeyIfNotExists(label: "Dict-S\(sector)-\(keyType == 0x60 ? "A" : "B")", key: key)
                             break // Found key for this type, move to next
                         } else {
                             // Reselect card after failed auth

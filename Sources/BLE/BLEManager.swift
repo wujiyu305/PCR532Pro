@@ -103,6 +103,8 @@ class BLEManager: NSObject, ObservableObject {
     private var rxByteCount: Int = 0
     private var debugLines: [String] = []
     private var lastTxTime: Date = .distantPast
+    private let lastDeviceUUIDKey = "pcr532_last_connected_device_uuid"
+    private let autoReconnectKey = "pcr532_auto_reconnect_enabled"
     
     override init() {
         super.init()
@@ -110,6 +112,32 @@ class BLEManager: NSObject, ObservableObject {
     }
     
     func startScan() { startScanAll() }
+    
+    /// Attempt to reconnect to previously paired device or start auto-scan
+    func attemptAutoConnect() {
+        guard centralManager.state == .poweredOn, !isConnected, connectionState != .connecting else { return }
+        
+        let autoReconnect = UserDefaults.standard.bool(forKey: autoReconnectKey)
+        guard autoReconnect, let uuidStr = UserDefaults.standard.string(forKey: lastDeviceUUIDKey),
+              let uuid = UUID(uuidString: uuidStr) else {
+            // No previous device, normal scan
+            startScanAll()
+            return
+        }
+        
+        // 1. Fast path: check if system already has this peripheral cached
+        let known = centralManager.retrievePeripherals(withIdentifiers: [uuid])
+        if let p = known.first {
+            appendDebug("Auto-reconnecting to cached device: \(p.name ?? uuidStr)")
+            let device = BLEDevice(id: p.identifier, name: p.name ?? "PCR532", rssi: -60, peripheral: p)
+            connect(to: device)
+            return
+        }
+        
+        // 2. Otherwise start scan to actively search for the previous device
+        appendDebug("Scanning for previous device (\(uuidStr.prefix(8))...)")
+        startScanAll()
+    }
     
     func startScanFilteredByService() {
         guard centralManager.state == .poweredOn else { return }
@@ -150,12 +178,19 @@ class BLEManager: NSObject, ObservableObject {
         responseBuffer.clear()
         debugLines.removeAll()
         stopScan()
+        
+        // Save device UUID for automatic reconnect
+        UserDefaults.standard.set(device.peripheral.identifier.uuidString, forKey: lastDeviceUUIDKey)
+        UserDefaults.standard.set(true, forKey: autoReconnectKey)
+        
         centralManager.connect(device.peripheral, options: nil)
         connectedPeripheral = device.peripheral
         connectedPeripheral?.delegate = self
     }
     
     func disconnect() {
+        // User explicitly disconnected: disable auto-reconnect
+        UserDefaults.standard.set(false, forKey: autoReconnectKey)
         guard let p = connectedPeripheral else { return }
         failPending(PN532Error.notConnected)
         centralManager.cancelPeripheralConnection(p)
@@ -561,6 +596,9 @@ class BLEManager: NSObject, ObservableObject {
 extension BLEManager: @preconcurrency CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         delegate?.bleDidUpdateState(central.state == .poweredOn)
+        if central.state == .poweredOn {
+            attemptAutoConnect()
+        }
     }
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
@@ -576,6 +614,15 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             discoveredDevices.sort { $0.rssi > $1.rssi }
         }
         delegate?.bleDidDiscoverDevice(device)
+        
+        // Auto-connect to previously paired device if found
+        let autoReconnect = UserDefaults.standard.bool(forKey: autoReconnectKey)
+        if autoReconnect, !isConnected, connectionState != .connecting,
+           let savedUUID = UserDefaults.standard.string(forKey: lastDeviceUUIDKey),
+           peripheral.identifier.uuidString == savedUUID {
+            appendDebug("Found paired device! Auto-connecting...")
+            connect(to: device)
+        }
     }
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -606,6 +653,15 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             BLEDevice(id: peripheral.identifier, name: peripheral.name ?? "", rssi: 0, peripheral: peripheral),
             error: error
         )
+        
+        // If not explicitly disconnected by user, schedule auto-reconnect
+        let autoReconnect = UserDefaults.standard.bool(forKey: autoReconnectKey)
+        if autoReconnect {
+            appendDebug("Disconnected. Will attempt auto-reconnect in 1.5s...")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.attemptAutoConnect()
+            }
+        }
     }
 }
 
